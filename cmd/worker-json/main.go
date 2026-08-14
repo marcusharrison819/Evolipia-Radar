@@ -1,0 +1,189 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/hidatara-ds/evolipia-radar/pkg/config"
+	"github.com/hidatara-ds/evolipia-radar/pkg/db"
+	"github.com/hidatara-ds/evolipia-radar/pkg/services"
+)
+
+type NewsItem struct {
+	ID           string    `json:"id"`
+	Title        string    `json:"title"`
+	URL          string    `json:"url"`
+	Domain       string    `json:"domain"`
+	PublishedAt  time.Time `json:"published_at"`
+	Category     string    `json:"category"`
+	Score        float64   `json:"score"`
+	TLDR         string    `json:"tldr,omitempty"`
+	WhyItMatters string    `json:"why_it_matters,omitempty"`
+	Tags         []string  `json:"tags,omitempty"`
+}
+
+type NewsData struct {
+	Items       []NewsItem `json:"items"`
+	LastUpdated time.Time  `json:"last_updated"`
+	TotalCount  int        `json:"total_count"`
+}
+
+func main() {
+	cfg := config.Load()
+	outputPath := getOutputPath()
+	newsData := NewsData{
+		Items:       []NewsItem{},
+		LastUpdated: time.Now(),
+		TotalCount:  0,
+	}
+
+	// Connect to database
+	database, err := db.New(cfg)
+	if err != nil {
+		if shouldSkipDatabaseWork() {
+			log.Printf("Skipping database work in CI mode. reason=%v", err)
+			writeJSONOutput(outputPath, newsData)
+			return
+		}
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer database.Close()
+
+	// Run ingestion
+	w := services.NewWorker(database, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	log.Println("Starting ingestion...")
+	if err := w.RunIngestion(ctx); err != nil {
+		log.Printf("Ingestion error: %v", err)
+	} else {
+		log.Println("Ingestion completed successfully")
+	}
+
+	// Fetch latest news from database
+	log.Println("Fetching latest news...")
+	items, err := fetchLatestNews(ctx, database)
+	if err != nil {
+		if shouldSkipDatabaseWork() {
+			log.Printf("Skipping database read in CI mode. reason=%v", err)
+			writeJSONOutput(outputPath, newsData)
+			return
+		}
+		log.Fatalf("Failed to fetch news: %v", err)
+	}
+
+	newsData = NewsData{
+		Items:       items,
+		LastUpdated: time.Now(),
+		TotalCount:  len(items),
+	}
+
+	writeJSONOutput(outputPath, newsData)
+}
+
+func getOutputPath() string {
+	outputPath := os.Getenv("JSON_OUTPUT_PATH")
+	if outputPath == "" {
+		return "data/news.json"
+	}
+
+	return outputPath
+}
+
+func shouldSkipDatabaseWork() bool {
+	return os.Getenv("SKIP_DB") == "true" || os.Getenv("CI") == "true"
+}
+
+func writeJSONOutput(outputPath string, newsData NewsData) {
+	outputDir := filepath.Dir(outputPath)
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		log.Fatalf("Failed to create output directory: %v", err)
+	}
+
+	// #nosec G304 - Path is from environment variable or default, controlled by deployment
+	file, err := os.Create(filepath.Clean(outputPath))
+	if err != nil {
+		log.Fatalf("Failed to create output file: %v", err)
+	}
+	defer func() {
+		if cerr := file.Close(); cerr != nil {
+			log.Printf("Error closing file: %v", cerr)
+		}
+	}()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(newsData); err != nil {
+		log.Fatalf("Failed to write JSON: %v", err)
+	}
+
+	log.Printf("Successfully wrote %d items to %s", newsData.TotalCount, outputPath)
+}
+
+func fetchLatestNews(ctx context.Context, database *db.DB) ([]NewsItem, error) {
+	query := `
+		SELECT 
+			i.id,
+			i.title,
+			i.url,
+			i.domain,
+			i.published_at,
+			i.category,
+			COALESCE(s.final, 0) as score,
+			COALESCE(sm.tldr, '') as tldr,
+			COALESCE(sm.why_it_matters, '') as why_it_matters,
+			COALESCE(sm.tags, '[]'::jsonb) as tags
+		FROM items i
+		LEFT JOIN scores s ON i.id = s.item_id
+		LEFT JOIN summaries sm ON i.id = sm.item_id
+		WHERE i.published_at >= NOW() - INTERVAL '7 days'
+		ORDER BY COALESCE(s.final, 0) DESC, i.published_at DESC
+		LIMIT 100
+	`
+
+	rows, err := database.Pool.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var items []NewsItem
+	for rows.Next() {
+		var item NewsItem
+		var tagsJSON []byte
+
+		err := rows.Scan(
+			&item.ID,
+			&item.Title,
+			&item.URL,
+			&item.Domain,
+			&item.PublishedAt,
+			&item.Category,
+			&item.Score,
+			&item.TLDR,
+			&item.WhyItMatters,
+			&tagsJSON,
+		)
+		if err != nil {
+			log.Printf("Error scanning row: %v", err)
+			continue
+		}
+
+		// Parse tags JSON
+		if len(tagsJSON) > 0 {
+			if err := json.Unmarshal(tagsJSON, &item.Tags); err != nil {
+				log.Printf("Error parsing tags: %v", err)
+				item.Tags = []string{}
+			}
+		}
+
+		items = append(items, item)
+	}
+
+	return items, rows.Err()
+}
